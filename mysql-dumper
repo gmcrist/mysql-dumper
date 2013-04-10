@@ -1,0 +1,212 @@
+#!/bin/bash
+# MySQL Dumper
+#
+# Copyright (c) 2009-2013 Greg M. Crist, Jr. <gmcrist@gmail.com>
+#
+#
+# LICENSE
+#
+# This source file is subject to the MIT license
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+#
+# DESCRIPTION:
+#   Dumps up all databases from a mysql server into individual SQL files
+#
+#
+# REQUIRES:
+#   mysql client    Used to connect and get list of databases from the mysql server
+#   mysqldump       Performs the actual dumps
+#   stat            Used to test configuration file permissions
+#   grep            Used to 
+#
+#
+# USAGE:
+#   mysql-dumper [ -c config_file -h hostname -u username -p -d database -o output_dir -z ]
+#
+#
+# CONFIGURATION:
+#    Command-Line Configuration Parameters
+#
+#     -c    Load configuration from this configuration file
+#     -h    Hostname of the mysql server (if not specified, connects to default
+#           mysql connection)
+#     -u    Username to log in with
+#     -p    Prompt for password (only applies if a username is specified)
+#     -d    Dump only this database
+#     -o    Output directory to
+#     -z    GZIP the output SQL file
+#
+#   Configuration file options
+#
+#     CAUTION: The configuration file is included as a shell script source and
+#     therefore, anything entered into that file is treated as a shell script.
+#
+#     Configuration file format:
+#       KEY=value   Where value is a string, number, or even shell script itself
+#
+#     Configuration variables and default values:
+#       HOSTNAME=""
+#       USERNAME=""
+#       PASSWORD=""
+#       DATABASE=""
+#       OUTPUTDIR=${PWD}
+#       GZIP_ENABLED=0
+#       PASSWORD_PROMPT=0
+#       COMMAND_GZIP="gzip"
+#       COMMAND_MYSQL="mysql"
+#       COMMAND_MYSQLDUMP="mysqldump"
+#       EXCLUDE_DATABASES=(information_schema performance_schema)
+#
+
+
+# Default configuration file
+CONFIG_FILE=/etc/mysql-dumper.conf
+
+# Default values (can be overridden via configuration file or command line option)
+HOSTNAME=""
+USERNAME=""
+PASSWORD=""
+DATABASE=""
+
+OUTPUTDIR=${PWD}
+GZIP_ENABLED=0
+PASSWORD_PROMPT=0
+
+# Default command options (can be overridden via configuration file)
+COMMAND_GZIP="gzip"
+COMMAND_MYSQL="mysql"
+COMMAND_MYSQLDUMP="mysqldump --force --opt --set-gtid-purged=OFF"
+
+# Excluded mysql databases
+EXCLUDE_DATABASES=(information_schema performance_schema)
+
+# Conditionally handle stat command differences on Mac OS X based systems
+if [[ $(uname) == 'Darwin' ]]; then
+    COMMAND_STAT="stat -f %Lp"
+else
+    COMMAND_STAT="stat --format %a"
+fi
+
+# Load the default configuration file if present
+if [[ -f $CONFIG_FILE ]]; then
+    # Do not load the default configuration file if it is group or world writable
+    if [[ $($COMMAND_STAT $CONFIG_FILE) == 600 ]]; then
+        source $CONFIG_FILE
+    else
+        echo "Exiting: Configuration file must not be group or world writable"
+        exit
+    fi
+fi
+
+while getopts :c:h:u:pd:o:z OPTION
+do
+    case ${OPTION} in
+        c)
+            CONFIG_FILE=${OPTARG}
+
+            if [[ -f $CONFIG_FILE ]]; then
+                source $CONFIG_FILE
+            else
+                echo "Exiting: Configuration file not found"
+                exit 1
+            fi
+            ;;
+        h)
+            HOSTNAME=${OPTARG}
+            ;;
+        u)
+            USERNAME=${OPTARG}
+            ;;
+        p)
+            PASSWORD_PROMPT=1
+            ;;
+        d)
+            DATABASE=${OPTARG}
+            ;;
+        o)
+            OUTPUTDIR=${OPTARG}
+            ;;
+        z)
+            GZIP_ENABLED=1
+            ;;
+        ?)
+            SELF=$(basename $0)
+            echo "Usage: ${SELF} [ -c config_file -h hostname -u username -p -d database -o output_dir -z ]"
+            exit 2
+            ;;
+    esac
+done
+
+# Prompt for password if specified and a username is set - no sense asking for a password without a username
+if [[ "$USERNAME" != "" ]]; then
+    if [[ $PASSWORD_PROMPT == 1 ]]; then
+        echo "Enter password for" $USERNAME":"
+        oldmodes=`stty -g`
+        stty -echo
+        read PASSWORD
+        stty $oldmodes
+    fi
+fi
+
+# Create the output directory if it does not already exist
+if [[ ! -d "$OUTPUTDIR" ]]; then
+    mkdir -p $OUTPUTDIR
+    
+    if [[ $? != 0 ]]; then
+        echo "Exiting: Could not create output directory"
+        exit 1
+    fi
+fi
+
+# Process the list of databases to exclude
+EXCLUDE_DATABASES=$(printf "|%s" "${EXCLUDE_DATABASES[@]}")
+EXCLUDE_DATABASES=${EXCLUDE_DATABASES:1}
+EXCLUDE_DATABASES="(Database|"$EXCLUDE_DATABASES")"
+
+# Get the list of databases to back up
+if [[ "$DATABASE" == "" ]]; then
+    databases=`$COMMAND_MYSQL --host=$HOSTNAME --user=$USERNAME --password=$PASSWORD -e "SHOW DATABASES;" | grep -Evi "$EXCLUDE_DATABASES"`
+else
+    databases=($DATABASE)
+fi
+
+# Check to see if the command executed successfully before performing the dumps
+if [[ $? == 0 ]]; then
+    # Dump each database
+    for database in $databases; do
+        echo "Dumping mysql database:" $database
+
+        # Compress the dump if option is present
+        if [[ $GZIP_ENABLED == 1 ]]; then
+            $COMMAND_MYSQLDUMP --host=$HOSTNAME --user=$USERNAME --password=$PASSWORD --databases $database | $COMMAND_GZIP > "$OUTPUTDIR/$database.sql.gz"
+        else
+            $COMMAND_MYSQLDUMP --host=$HOSTNAME --user=$USERNAME --password=$PASSWORD --databases $database > "$OUTPUTDIR/$database.sql"
+       	fi
+
+       	# Notify of error on dump
+       	if [ $? != 0 ]; then
+       	    echo "Error dumping mysql database:" $db
+       	fi
+    done
+else
+    echo "Error connecting to mysql database"
+    exit 1
+fi
